@@ -10,6 +10,12 @@
 
 #define CPPHTTPLIB_VERSION "0.14.0"
 
+extern "C" {
+extern int httplib_debug_log_enabled;
+}
+
+#define debug_log(...) if (httplib_debug_log_enabled) printf(__VA_ARGS__)
+
 /*
  * Configuration
  */
@@ -2745,6 +2751,8 @@ inline ssize_t select_write(socket_t sock, time_t sec, time_t usec) {
 
 inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
                                         time_t usec) {
+  debug_log("[httplib] wait_until_socket_is_ready: %d %ld %ld \n", sock, sec, usec);
+
 #ifdef CPPHTTPLIB_USE_POLL
   struct pollfd pfd_read;
   pfd_read.fd = sock;
@@ -2768,7 +2776,10 @@ inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
   return Error::Connection;
 #else
 #ifndef _WIN32
-  if (sock >= FD_SETSIZE) { return Error::Connection; }
+  if (sock >= FD_SETSIZE) {
+    debug_log("[httplib] wait_until_socket_is_ready: invalid socket (sock >= FD_SETSIZE)\n");
+    return Error::Connection;
+  }
 #endif
 
   fd_set fdsr;
@@ -2786,7 +2797,10 @@ inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
     return select(static_cast<int>(sock + 1), &fdsr, &fdsw, &fdse, &tv);
   });
 
-  if (ret == 0) { return Error::ConnectionTimeout; }
+  if (ret == 0) {
+    debug_log("[httplib] wait_until_socket_is_ready: timeout\n");
+    return Error::ConnectionTimeout;
+  }
 
   if (ret > 0 && (FD_ISSET(sock, &fdsr) || FD_ISSET(sock, &fdsw))) {
     auto error = 0;
@@ -2794,8 +2808,12 @@ inline Error wait_until_socket_is_ready(socket_t sock, time_t sec,
     auto res = getsockopt(sock, SOL_SOCKET, SO_ERROR,
                           reinterpret_cast<char *>(&error), &len);
     auto successful = res >= 0 && !error;
+    if (!successful) {
+      debug_log("[httplib] wait_until_socket_is_ready: getsockopt result = %d err = %d %s\n", res, error, strerror(error));
+    }
     return successful ? Error::Success : Error::Connection;
   }
+  debug_log("[httplib] wait_until_socket_is_ready: connection failed %d %s\n", errno, strerror(errno));
   return Error::Connection;
 #endif
 }
@@ -2942,6 +2960,8 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
                        int address_family, int socket_flags, bool tcp_nodelay,
                        SocketOptions socket_options,
                        BindOrConnect bind_or_connect) {
+  debug_log("[httplib] create_socket: %s, %s, %d, %d, %d, %d\n", host.c_str(),
+               ip.c_str(), port, address_family, socket_flags, tcp_nodelay);
   // Get address info
   const char *node = nullptr;
   struct addrinfo hints;
@@ -2992,6 +3012,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
   auto service = std::to_string(port);
 
   if (getaddrinfo(node, service.c_str(), &hints, &result)) {
+    debug_log("[httplib] create_socket: getaddrinfo %s %s => error %d %s\n",node, service.c_str(), errno, strerror(errno));
 #if defined __linux__ && !defined __ANDROID__
     res_init();
 #endif
@@ -3024,10 +3045,14 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 #else
     auto sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 #endif
-    if (sock == INVALID_SOCKET) { continue; }
+    if (sock == INVALID_SOCKET) {
+      debug_log("[httplib] create_socket: socket %d %d %d => error %d %s\n",rp->ai_family, rp->ai_socktype, rp->ai_protocol, errno, strerror(errno));
+      continue;
+    }
 
 #ifndef _WIN32
     if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
+      debug_log("[httplib] create_socket: fcntl FD_CLOEXEC %d => error %d %s\n",sock, errno, strerror(errno));
       close_socket(sock);
       continue;
     }
@@ -3065,7 +3090,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 
     close_socket(sock);
   }
-
+  debug_log("[httplib] create_socket: no socket created\n");
   freeaddrinfo(result);
   return INVALID_SOCKET;
 }
@@ -3165,6 +3190,12 @@ inline socket_t create_client_socket(
   auto sock = create_socket(
       host, ip, port, address_family, 0, tcp_nodelay, std::move(socket_options),
       [&](socket_t sock2, struct addrinfo &ai) -> bool {
+        if (httplib_debug_log_enabled) {
+          char name[INET6_ADDRSTRLEN] = {};
+          char port[10] = {};
+          getnameinfo(ai.ai_addr,ai.ai_addrlen, name, sizeof(name), port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV);
+          debug_log("[httplib] create_client_socket: connecting to %s:%s, if %s.\n", name, port, intf.c_str());
+        }
         if (!intf.empty()) {
 #ifdef USE_IF2IP
           auto ip_from_if = if2ip(address_family, intf);
@@ -3177,18 +3208,21 @@ inline socket_t create_client_socket(
         }
 
         set_nonblocking(sock2, true);
-
         auto ret =
             ::connect(sock2, ai.ai_addr, static_cast<socklen_t>(ai.ai_addrlen));
 
         if (ret < 0) {
           if (is_connection_error()) {
+            debug_log("[httplib] create_client_socket: connection error %d %s\n", errno, strerror(errno));
             error = Error::Connection;
             return false;
           }
           error = wait_until_socket_is_ready(sock2, connection_timeout_sec,
                                              connection_timeout_usec);
-          if (error != Error::Success) { return false; }
+          if (error != Error::Success) {
+            debug_log("[httplib] create_client_socket: wait_until_socket_is_ready Error %d\n", error);
+            return false;
+          }
         }
 
         set_nonblocking(sock2, false);
@@ -3226,11 +3260,14 @@ inline socket_t create_client_socket(
         error = Error::Success;
         return true;
       });
-
+  debug_log("[httplib] create_client_socket: sock %d err %d\n", sock, error);
   if (sock != INVALID_SOCKET) {
     error = Error::Success;
   } else {
-    if (error == Error::Success) { error = Error::Connection; }
+    if (error == Error::Success) {
+      debug_log("[httplib] create_client_socket: invalid socket\n");
+      error = Error::Connection;
+    }
   }
 
   return sock;
@@ -6878,6 +6915,7 @@ inline bool ClientImpl::handle_request(Stream &strm, Request &req,
                                        Response &res, bool close_connection,
                                        Error &error) {
   if (req.path.empty()) {
+    debug_log("[httplib] ClientImpl::handle_request req.path.empty()");
     error = Error::Connection;
     return false;
   }
